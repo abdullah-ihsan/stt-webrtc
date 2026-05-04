@@ -333,13 +333,15 @@ async def offer(request: Request):
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
-        if pc.connectionState in ("failed", "closed"):
+        log.info(f"PC state: {pc.connectionState}")
+
+        if pc.connectionState in ("failed", "closed", "disconnected"):
             await cleanup_pc(pc)
 
-    @pc.on("iceconnectionstatechange")
-    async def on_iceconnectionstatechange():
-        if pc.iceConnectionState in ("failed", "closed"):
-            await cleanup_pc(pc)
+    # @pc.on("iceconnectionstatechange")
+    # async def on_iceconnectionstatechange():
+    #     if pc.iceConnectionState in ("failed", "closed"):
+    #         await cleanup_pc(pc)
 
     @pc.on("track")
     def on_track(track):

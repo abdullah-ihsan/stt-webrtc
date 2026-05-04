@@ -368,7 +368,19 @@
             }
 
             pc.onconnectionstatechange = () => {
-                if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) stop();
+                // if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) stop();
+                pc.onconnectionstatechange = () => {
+                    console.log("state:", pc.connectionState);
+
+                    if (pc.connectionState === "failed") {
+                        stop();
+                    }
+
+                    // optional: only stop on explicit close
+                    if (pc.connectionState === "closed") {
+                        stop();
+                    }
+                };
             };
         }
 
