@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+from networkx import config
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -319,7 +320,16 @@ async def offer(request: Request):
     if provider not in HANDLERS:
         return JSONResponse({"error": "Unsupported provider"}, status_code=400)
 
-    pc = RTCPeerConnection()
+    config = RTCConfiguration([
+        RTCIceServer(urls="stun:stun.l.google.com:19302"),
+        RTCIceServer(
+            urls="turn:free.expressturn.com:3478",
+            username=os.getenv("EXPRESS_TURN_USERNAME"),
+            credential=os.getenv("EXPRESS_TURN_CREDENTIAL")
+        )
+    ])
+
+    pc = RTCPeerConnection(configuration=config)
     pcs.add(pc)
 
     @pc.on("connectionstatechange")
