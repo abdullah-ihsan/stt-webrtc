@@ -6,3 +6,4 @@ python-dotenv
 websockets
 deepgram-sdk
 speechmatics-python
+websockets

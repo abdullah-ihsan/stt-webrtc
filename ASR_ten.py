@@ -2,30 +2,19 @@ import asyncio
 import json
 import logging
 import os
-import av
 from abc import ABC, abstractmethod
+from typing import AsyncGenerator
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
-
-# ── Configuration ─────────────────────────────────────────────────────────────
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("webrtc-transcription")
+log = logging.getLogger("ws-transcription")
 
-app = FastAPI(title="WebRTC Multi-Provider Transcription")
-pcs: set[RTCPeerConnection] = set()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="WebSocket Transcription")
 
 KEYS = {
     "speechmatics": os.getenv("SPEECHMATICS_API_KEY"),
@@ -37,10 +26,8 @@ PCM_SAMPLE_RATE = 16000
 MSG_PARTIAL = "PARTIAL"
 MSG_FINAL = "FINAL"
 
-# AssemblyAI
-AAI_MODEL         = "u3-rt-pro"
-AAI_EOT_THRESHOLD = 0.4     # end-of-turn confidence; lower = faster turn detection
-
+AAI_MODEL = "u3-rt-pro"
+AAI_EOT_THRESHOLD = 0.4
 AAI_WS_URL = (
     f"wss://streaming.assemblyai.com/v3/ws"
     f"?speech_model={AAI_MODEL}"
@@ -51,32 +38,27 @@ AAI_WS_URL = (
 )
 
 
-# ── Base Handler with Clean Lifecycle ────────────────────────────────────────
-
 class BaseTranscriptionHandler(ABC):
-    def __init__(self, track, data_channel):
-        self.track = track
-        self.dc = data_channel
-        self.resampler = av.AudioResampler(format="s16", layout="mono", rate=PCM_SAMPLE_RATE)
+    def __init__(self, websocket: WebSocket):
+        self.ws = websocket
         self._task: asyncio.Task | None = None
         self._closed = False
-
-        # Push-to-talk: accumulate all final transcript segments for this turn
         self._turn_finals: list[str] = []
         self._stop_requested = asyncio.Event()
+        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
 
     def handle_client_message(self, raw: str):
-        """Called when client sends a message over the data channel (e.g. stop signal)."""
         try:
             msg = json.loads(raw)
             if msg.get("type") == "stop":
-                log.info("Client requested turn stop — flushing turn")
                 self._stop_requested.set()
-        except Exception:
+        except:
             pass
 
+
     async def flush_turn(self):
-        """Emit the complete turn text as a single 'turn_complete' message."""
+        if self._closed:
+            return
         SENTENCE_END = {".", "!", "?"}
         parts = [s.strip() for s in self._turn_finals if s.strip()]
         joined = []
@@ -84,39 +66,48 @@ class BaseTranscriptionHandler(ABC):
             if i > 0 and joined and joined[-1][-1] not in SENTENCE_END:
                 joined[-1] += "."
             joined.append(part)
-        full_text = " ".join(joined)
+        full_text = " ".join(joined).strip()
         self._turn_finals.clear()
-        if full_text and self.dc and self.dc.readyState == "open":
+
+        if full_text:
             try:
                 payload = json.dumps({"type": "turn_complete", "text": full_text})
-                self.dc.send(payload)
-                log.info(f"Turn complete: {full_text[:80]}...")
-            except Exception as e:
-                log.warning(f"DataChannel send failed on flush: {e}")
+                await self.ws.send_text(payload)
+                log.info(f"✅ Turn complete sent: {full_text[:80]}...")
+            except:
+                self._closed = True
 
     async def send_text(self, prefix: str, text: str):
         if not text or not text.strip() or self._closed:
             return
 
-        # Accumulate finals into turn buffer (don't emit partials to LLM)
         if prefix == MSG_FINAL:
             self._turn_finals.append(text.strip())
 
-        if self.dc and self.dc.readyState == "open":
-            try:
-                payload = json.dumps({"type": prefix.lower(), "text": text.strip()})
-                self.dc.send(payload)
-            except Exception as e:
-                log.warning(f"DataChannel send failed: {e}")
+        try:
+            payload = json.dumps({"type": prefix.lower(), "text": text.strip()})
+            await self.ws.send_text(payload)
+        except Exception as e:
+            log.warning(f"WS send failed: {e}")
+            self._closed = True
 
-    async def get_audio_chunks(self):
+
+    async def get_audio_chunks(self) -> AsyncGenerator[bytes, None]:
         while not self._closed:
             try:
-                frame = await self.track.recv()
-                for resampled in self.resampler.resample(frame):
-                    yield resampled.to_ndarray().tobytes()
-            except Exception:
+                chunk = await self._audio_queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+            except:
                 break
+
+    async def put_audio(self, data: bytes):
+        if not self._closed:
+            try:
+                await self._audio_queue.put(data)
+            except asyncio.QueueFull:
+                pass  # drop old chunks
 
     @abstractmethod
     async def run(self):
@@ -126,9 +117,9 @@ class BaseTranscriptionHandler(ABC):
         if self._task is None:
             self._task = asyncio.create_task(self._run_wrapper())
 
+
     async def _run_wrapper(self):
         try:
-            # Run transcription and wait for stop signal concurrently
             run_task = asyncio.create_task(self.run())
             stop_task = asyncio.create_task(self._stop_requested.wait())
             done, pending = await asyncio.wait(
@@ -163,22 +154,8 @@ class BaseTranscriptionHandler(ABC):
             except asyncio.CancelledError:
                 pass
 
-        # Cleanup resampler
-        try:
-            if hasattr(self.resampler, "close"):
-                self.resampler.close()
-        except Exception:
-            pass
 
-        # Close data channel
-        if self.dc and self.dc.readyState in ("open", "connecting"):
-            try:
-                self.dc.close()
-            except Exception:
-                pass
-
-
-# ── Provider Handlers ────────────────────────────────────────────────────────
+# ── Provider Handlers (Mostly Unchanged) ─────────────────────────────────────
 
 class SpeechmaticsHandler(BaseTranscriptionHandler):
     async def run(self):
@@ -294,95 +271,61 @@ HANDLERS = {
 }
 
 
-# ── Cleanup Utility ──────────────────────────────────────────────────────────
+# ── WebSocket Endpoint (Robust) ─────────────────────────────────────────────
+@app.websocket("/ws/transcribe")
+async def websocket_transcribe(websocket: WebSocket):
+    await websocket.accept()
+    log.info("WebSocket client connected")
 
-async def cleanup_pc(pc: RTCPeerConnection):
-    handler = getattr(pc, "handler", None)
-    if handler:
-        await handler.close()
+    provider = "assemblyai"
+    handler = None
 
     try:
-        await pc.close()
+        # Get provider from first message
+        first_msg = await websocket.receive_text()
+        try:
+            data = json.loads(first_msg)
+            provider = data.get("provider", "assemblyai").lower()
+        except:
+            pass
+        if provider not in HANDLERS:
+            provider = "assemblyai"
+
+        log.info(f"WebSocket using provider: {provider}")
+
+        # Create handler
+        handler = HANDLERS[provider](websocket)   # ← This is the correct call now
+
+        await handler.start()
+
+        while not handler._closed:
+            try:
+                message = await asyncio.wait_for(websocket.receive(), timeout=0.8)
+                if message["type"] == "websocket.receive":
+                    if "bytes" in message:
+                        await handler.put_audio(message["bytes"])
+                    elif "text" in message:
+                        handler.handle_client_message(message["text"])
+            except asyncio.TimeoutError:
+                continue
+            except (WebSocketDisconnect, Exception):
+                break
+
+    except WebSocketDisconnect:
+        log.info("Client disconnected normally")
     except Exception as e:
-        log.warning(f"Error closing PC: {e}")
-
-    pcs.discard(pc)
-
-
-# ── WebRTC Routes ────────────────────────────────────────────────────────────
-
-@app.post("/offer")
-async def offer(request: Request):
-    params = await request.json()
-    provider = params.get("provider", "assemblyai").lower()
-
-    if provider not in HANDLERS:
-        return JSONResponse({"error": "Unsupported provider"}, status_code=400)
-
-    config = RTCConfiguration([
-        RTCIceServer(urls="stun:stun.l.google.com:19302"),
-        RTCIceServer(
-            urls="turn:free.expressturn.com:3478",
-            username=os.getenv("EXPRESS_TURN_USERNAME"),
-            credential=os.getenv("EXPRESS_TURN_CREDENTIAL")
-        )
-    ])
-
-    pc = RTCPeerConnection(configuration=config)
-    pcs.add(pc)
-
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        log.info(f"PC state: {pc.connectionState}")
-
-        if pc.connectionState in ("failed", "closed", "disconnected"):
-            await cleanup_pc(pc)
-
-    # @pc.on("iceconnectionstatechange")
-    # async def on_iceconnectionstatechange():
-    #     if pc.iceConnectionState in ("failed", "closed"):
-    #         await cleanup_pc(pc)
-
-    @pc.on("track")
-    def on_track(track):
-        if track.kind != "audio":
-            return
-
-        @pc.on("datachannel")
-        def on_datachannel(dc):
-            handler = HANDLERS[provider](track, dc)
-            pc.handler = handler          # Attach for cleanup
-            asyncio.create_task(handler.start())
-
-            @dc.on("message")
-            def on_dc_message(msg):
-                handler.handle_client_message(msg)
-
-            @track.on("ended")
-            async def on_track_ended():
-                await cleanup_pc(pc)
-
-    await pc.setRemoteDescription(RTCSessionDescription(sdp=params["sdp"], type=params["type"]))
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-
-    return JSONResponse({
-        "sdp": pc.localDescription.sdp,
-        "type": pc.localDescription.type
-    })
+        log.error(f"WebSocket error: {e}", exc_info=True)
+    finally:
+        if handler:
+            await handler.close()
+        log.info("WebSocket connection closed")
 
 
 @app.get("/")
 async def index():
     return HTMLResponse(open("index.html").read())
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    log.info(f"Shutting down: closing {len(pcs)} connections")
-    for pc in list(pcs):
-        await cleanup_pc(pc)
-
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=9800)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

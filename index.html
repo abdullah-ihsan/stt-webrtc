@@ -145,12 +145,14 @@
 
     <div id="status">Status: Ready</div>
     <div id="transcript"></div>
-
     <script>
-        let pc = null;
-        let localStream = null;
+        let ws = null;
+        let audioContext = null;
+        let mediaStream = null;
+        let processor = null;
         let activeTurnBlock = null;
         let turnCounter = 0;
+
 
         const toggleBtn    = document.getElementById('toggleBtn');
         const statusEl     = document.getElementById('status');
@@ -245,70 +247,82 @@
             scrollBottom();
         }
 
-        // ── WebRTC ───────────────────────────────────
-
         async function stop() {
-            if (pc) {
-                const dc = pc._dc;
-                if (dc && dc.readyState === "open") {
-                    try { dc.send(JSON.stringify({ type: "stop" })); } catch (_) {}
-                }
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                try {
+                    ws.send(JSON.stringify({ type: "stop" }));   // Tell server to flush
+                    await new Promise(r => setTimeout(r, 800)); // Give time for flush_turn
+                } catch (_) {}
             }
-            // Give turn_complete time to arrive
-            await new Promise(r => setTimeout(r, 350));
 
-            if (pc) { pc.close(); pc = null; }
-            if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+            if (processor) { processor.disconnect(); processor = null; }
+            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+            if (audioContext) { await audioContext.close().catch(() => {}); audioContext = null; }
+            if (ws) { ws.close(); ws = null; }
 
             toggleBtn.textContent = 'Start Turn';
             toggleBtn.classList.remove('recording');
             setStatus('Stopped');
         }
 
-        async function start() {
-            setStatus('Connecting...');
 
-            try {
-                localStream = await navigator.mediaDevices.getUserMedia({
-                    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-                });
-            } catch (err) {
-                setStatus('Microphone access denied or unavailable', true);
-                return;
+    // ── Audio Streaming ─────────────────────────────────────
+    async function startStreaming() {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: { 
+                echoCancellation: true, 
+                noiseSuppression: true, 
+                autoGainControl: true,
+                sampleRate: 16000
             }
+        });
 
-            pc = new RTCPeerConnection({
-            iceServers: [
-                {
-                urls: "stun:stun.l.google.com:19302"
-                },
-                {
-                urls: "turn:free.expressturn.com:3478",
-                username: "000000002093247712",
-                credential: "a66BNl1GZSndKXmU0zEPkH51pZI="
-                }
-            ]
-            });
-            const dc = pc.createDataChannel("transcription");
-            pc._dc = dc;
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
 
-            dc.onopen = () => {
-                setStatus('Streaming');
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+        processor.onaudioprocess = (e) => {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const inputData = e.inputBuffer.getChannelData(0);
+            const pcm16 = new Int16Array(inputData.length);
+
+            for (let i = 0; i < inputData.length; i++) {
+                pcm16[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+            }
+            ws.send(pcm16.buffer);
+        };
+
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+    }
+
+    // ── Main Start Function ─────────────────────────────────
+    async function start() {
+        setStatus('Connecting...');
+
+        try {
+            ws = new WebSocket(`ws://${window.location.host}/ws/transcribe`);
+
+            ws.onopen = async () => {
+                // You can change provider here
+                ws.send(JSON.stringify({ provider: "assemblyai" })); 
+
+                await startStreaming();
+
+                setStatus('Streaming - Speak now');
                 toggleBtn.textContent = 'End Turn';
                 toggleBtn.classList.add('recording');
                 activeTurnBlock = createTurnBlock();
             };
 
-            dc.onerror = (err) => {
-                console.error("DataChannel error:", err);
-                setStatus("DataChannel error", true);
-            };
-
-            dc.onmessage = (event) => {
+            ws.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
                     const type = data.type?.toLowerCase();
                     const text = data.text?.trim();
+                    console.log("Received message", { type, text });
 
                     switch (type) {
                         case "partial":
@@ -324,68 +338,31 @@
                                 sealTurnBlock(activeTurnBlock, text || '(no speech detected)');
                                 activeTurnBlock = null;
                             }
-                            setStatus('Turn complete — ready');
+                            setStatus('Turn complete — ready for next turn');
                             break;
 
                         case "error":
-                            if (text) { addLooseLine(text, 'error-line'); setStatus(text, true); }
+                            if (text) addLooseLine(text, 'error-line');
                             break;
-
-                        case "info":
-                            if (text) { addLooseLine(text, 'info-line'); setStatus(text); }
-                            break;
-
-                        default:
-                            if (text) addLooseLine(text, 'info-line');
                     }
-                } catch (_) {
-                    // Legacy plain-text fallback
-                    const raw = event.data.toString();
-                    if (raw.includes("PARTIAL:") && activeTurnBlock)
-                        upsertPartial(activeTurnBlock, raw.replace("PARTIAL:", "").trim());
-                    else if (raw.includes("FINAL:") && activeTurnBlock)
-                        appendSentence(activeTurnBlock, raw.replace("FINAL:", "").trim());
+                } catch (e) {
+                    console.error("Message parse error", e);
                 }
             };
 
-            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+            ws.onclose = () => stop();
+            ws.onerror = () => setStatus('Connection error', true);
 
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-
-            try {
-                const res = await fetch("/offer", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
-                });
-                if (!res.ok) throw new Error("Failed to get answer");
-                const answer = await res.json();
-                await pc.setRemoteDescription(new RTCSessionDescription(answer));
-            } catch (err) {
-                setStatus('Failed to connect to server', true);
-                stop();
-            }
-
-            pc.onconnectionstatechange = () => {
-                // if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) stop();
-                pc.onconnectionstatechange = () => {
-                    console.log("state:", pc.connectionState);
-
-                    if (pc.connectionState === "failed") {
-                        stop();
-                    }
-
-                    // optional: only stop on explicit close
-                    if (pc.connectionState === "closed") {
-                        stop();
-                    }
-                };
-            };
+        } catch (err) {
+            setStatus('Failed to connect', true);
         }
+    }
 
-        toggleBtn.onclick = () => { if (pc) stop(); else start(); };
-    </script>
+
+
+    toggleBtn.onclick = () => { if (ws) stop(); else start(); };
+</script>
+
 </body>
 
 </html>
