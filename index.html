@@ -303,7 +303,7 @@
         setStatus('Connecting...');
 
         try {
-            ws = new WebSocket(`ws://${window.location.host}/ws/transcribe`);
+            ws = new WebSocket(`wss://${window.location.host}/ws/transcribe`);
 
             ws.onopen = async () => {
                 // You can change provider here
