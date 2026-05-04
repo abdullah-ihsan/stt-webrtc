@@ -26,8 +26,10 @@ PCM_SAMPLE_RATE = 16000
 MSG_PARTIAL = "PARTIAL"
 MSG_FINAL = "FINAL"
 
-AAI_MODEL = "u3-rt-pro"
-AAI_EOT_THRESHOLD = 0.4
+# AssemblyAI
+AAI_MODEL         = "u3-rt-pro"
+AAI_EOT_THRESHOLD = 0.4     # end-of-turn confidence; lower = faster turn detection
+
 AAI_WS_URL = (
     f"wss://streaming.assemblyai.com/v3/ws"
     f"?speech_model={AAI_MODEL}"
@@ -37,6 +39,8 @@ AAI_WS_URL = (
     f"&end_of_turn_confidence_threshold={AAI_EOT_THRESHOLD}"
 )
 
+
+# ── Base Handler with Clean Lifecycle ────────────────────────────────────────
 
 class BaseTranscriptionHandler(ABC):
     def __init__(self, websocket: WebSocket):
@@ -120,6 +124,7 @@ class BaseTranscriptionHandler(ABC):
 
     async def _run_wrapper(self):
         try:
+            # Run transcription and wait for stop signal concurrently
             run_task = asyncio.create_task(self.run())
             stop_task = asyncio.create_task(self._stop_requested.wait())
             done, pending = await asyncio.wait(
@@ -282,8 +287,8 @@ async def websocket_transcribe(websocket: WebSocket):
 
     try:
         # Get provider from first message
-        first_msg = await websocket.receive_text()
         try:
+            first_msg = await websocket.receive_text()
             data = json.loads(first_msg)
             provider = data.get("provider", "assemblyai").lower()
         except:
