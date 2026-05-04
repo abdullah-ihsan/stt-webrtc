@@ -374,5 +374,4 @@ async def on_shutdown():
 
 if __name__ == "__main__":
     import uvicorn
-    # uvicorn.run(app, host="0.0.0.0", port=8000)
-    uvicorn.run(app, host="0.0.0.0", port=9800, ssl_keyfile="192.168.100.2-key.pem", ssl_certfile="192.168.100.2.pem")
+    uvicorn.run(app, host="0.0.0.0", port=9800)
