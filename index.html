@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Transcription</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: Arial, sans-serif;
+            background: #f8fafc;
+            padding: 40px;
+        }
+
+        h1 { color: #1e3a8a; margin-bottom: 6px; }
+        p  { color: #64748b; margin-bottom: 20px; }
+
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 14px;
+        }
+
+        button {
+            padding: 10px 18px;
+            font-size: 15px;
+            border-radius: 6px;
+            border: 1px solid #1e3a8a;
+            cursor: pointer;
+            background: #1e3a8a;
+            color: #fff;
+        }
+        button:disabled { opacity: 0.45; cursor: default; }
+        #toggleBtn.recording { background: #dc2626; border-color: #dc2626; }
+
+        #status {
+            font-size: 14px;
+            font-weight: 600;
+            padding: 10px 14px;
+            border-radius: 6px;
+            background: #e0f2fe;
+            color: #0369a1;
+            margin-bottom: 14px;
+        }
+        #status.error { background: #fee2e2; color: #b91c1c; }
+
+        /* ── Transcript container ──────────────────── */
+        #transcript {
+            background: #fff;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 16px;
+            height: 520px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        /* ── Turn block ────────────────────────────── */
+        .turn-block {
+            border: 1.5px solid #e2e8f0;
+            border-radius: 8px;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        /* Header bar */
+        .turn-header {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 12px;
+            font-size: 0.75em;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            background: #f1f5f9;
+            color: #94a3b8;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        .turn-block.live .turn-header {
+            background: #fef2f2;
+            color: #ef4444;
+            border-color: #fecaca;
+        }
+
+        /* Animated recording dot */
+        .turn-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            background: #94a3b8;
+        }
+        .turn-block.live  .turn-dot { background: #ef4444; animation: pulse 1s infinite; }
+        .turn-block.done  .turn-dot { background: #22c55e; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50%       { opacity: 0.3; }
+        }
+
+        /* Body */
+        .turn-body {
+            padding: 12px 14px;
+            font-size: 1em;
+            line-height: 1.75;
+            color: #1e293b;
+        }
+
+        /* Each committed sentence sits on its own line */
+        .sentence {
+            display: block;
+        }
+        .sentence + .sentence {
+            margin-top: 3px;
+        }
+
+        /* Partial preview — greyed out, at the bottom */
+        .partial-line {
+            display: block;
+            color: #94a3b8;
+            margin-top: 4px;
+        }
+
+        /* ── Loose info / error lines ──────────────── */
+        .info-line  { color: #0369a1; font-style: italic; font-size: 0.88em; padding: 2px 4px; }
+        .error-line { color: #b91c1c; font-size: 0.88em; padding: 2px 4px; }
+    </style>
+</head>
+
+<body>
+    <h1>CareBuddy - Live Transcription</h1>
+    <p>Click Start Turn to begin speaking. Click End Turn to stop and send.</p>
+
+    <div class="controls">
+        <button id="toggleBtn">Start Turn</button>
+    </div>
+
+    <div id="status">Status: Ready</div>
+    <div id="transcript"></div>
+
+    <script>
+        let pc = null;
+        let localStream = null;
+        let activeTurnBlock = null;
+        let turnCounter = 0;
+
+        const toggleBtn    = document.getElementById('toggleBtn');
+        const statusEl     = document.getElementById('status');
+        const transcriptEl = document.getElementById('transcript');
+
+        // ── UI helpers ───────────────────────────────
+
+        function setStatus(text, isError = false) {
+            statusEl.textContent = "Status: " + text;
+            statusEl.className = isError ? 'error' : '';
+        }
+
+        function scrollBottom() {
+            transcriptEl.scrollTop = transcriptEl.scrollHeight;
+        }
+
+        /** Spin up a new live turn card */
+        function createTurnBlock() {
+            turnCounter++;
+            const block = document.createElement('div');
+            block.className = 'turn-block live';
+
+            const header = document.createElement('div');
+            header.className = 'turn-header';
+
+            const dot = document.createElement('span');
+            dot.className = 'turn-dot';
+
+            const label = document.createElement('span');
+            label.textContent = `Turn ${turnCounter}`;
+
+            header.appendChild(dot);
+            header.appendChild(label);
+
+            const body = document.createElement('div');
+            body.className = 'turn-body';
+
+            block.appendChild(header);
+            block.appendChild(body);
+            transcriptEl.appendChild(block);
+            scrollBottom();
+            return block;
+        }
+
+        /** Add a committed sentence line to a turn block */
+        function appendSentence(block, text) {
+            const body = block.querySelector('.turn-body');
+            // Drop the trailing partial
+            const partial = body.querySelector('.partial-line');
+            if (partial) partial.remove();
+
+            const span = document.createElement('span');
+            span.className = 'sentence';
+            span.textContent = text;
+            body.appendChild(span);
+            scrollBottom();
+        }
+
+        /** Show / update the grey partial preview inside the active block */
+        function upsertPartial(block, text) {
+            const body = block.querySelector('.turn-body');
+            let partial = body.querySelector('.partial-line');
+            if (!partial) {
+                partial = document.createElement('span');
+                partial.className = 'partial-line';
+                body.appendChild(partial);
+            }
+            partial.textContent = text;
+            scrollBottom();
+        }
+
+        /** Seal the block: green dot, replace body with the authoritative full text */
+        function sealTurnBlock(block, fullText) {
+            block.classList.remove('live');
+            block.classList.add('done');
+
+            const body = block.querySelector('.turn-body');
+            body.innerHTML = '';
+
+            const span = document.createElement('span');
+            span.className = 'sentence';
+            span.textContent = fullText;
+            body.appendChild(span);
+            scrollBottom();
+        }
+
+        function addLooseLine(text, cls) {
+            const div = document.createElement('div');
+            div.className = cls;
+            div.textContent = text;
+            transcriptEl.appendChild(div);
+            scrollBottom();
+        }
+
+        // ── WebRTC ───────────────────────────────────
+
+        async function stop() {
+            if (pc) {
+                const dc = pc._dc;
+                if (dc && dc.readyState === "open") {
+                    try { dc.send(JSON.stringify({ type: "stop" })); } catch (_) {}
+                }
+            }
+            // Give turn_complete time to arrive
+            await new Promise(r => setTimeout(r, 350));
+
+            if (pc) { pc.close(); pc = null; }
+            if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+
+            toggleBtn.textContent = 'Start Turn';
+            toggleBtn.classList.remove('recording');
+            setStatus('Stopped');
+        }
+
+        async function start() {
+            setStatus('Connecting...');
+
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+                });
+            } catch (err) {
+                setStatus('Microphone access denied or unavailable', true);
+                return;
+            }
+
+            pc = new RTCPeerConnection();
+            const dc = pc.createDataChannel("transcription");
+            pc._dc = dc;
+
+            dc.onopen = () => {
+                setStatus('Streaming');
+                toggleBtn.textContent = 'End Turn';
+                toggleBtn.classList.add('recording');
+                activeTurnBlock = createTurnBlock();
+            };
+
+            dc.onerror = (err) => {
+                console.error("DataChannel error:", err);
+                setStatus("DataChannel error", true);
+            };
+
+            dc.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    const type = data.type?.toLowerCase();
+                    const text = data.text?.trim();
+
+                    switch (type) {
+                        case "partial":
+                            if (text && activeTurnBlock) upsertPartial(activeTurnBlock, text);
+                            break;
+
+                        case "final":
+                            if (text && activeTurnBlock) appendSentence(activeTurnBlock, text);
+                            break;
+
+                        case "turn_complete":
+                            if (activeTurnBlock) {
+                                sealTurnBlock(activeTurnBlock, text || '(no speech detected)');
+                                activeTurnBlock = null;
+                            }
+                            setStatus('Turn complete — ready');
+                            break;
+
+                        case "error":
+                            if (text) { addLooseLine(text, 'error-line'); setStatus(text, true); }
+                            break;
+
+                        case "info":
+                            if (text) { addLooseLine(text, 'info-line'); setStatus(text); }
+                            break;
+
+                        default:
+                            if (text) addLooseLine(text, 'info-line');
+                    }
+                } catch (_) {
+                    // Legacy plain-text fallback
+                    const raw = event.data.toString();
+                    if (raw.includes("PARTIAL:") && activeTurnBlock)
+                        upsertPartial(activeTurnBlock, raw.replace("PARTIAL:", "").trim());
+                    else if (raw.includes("FINAL:") && activeTurnBlock)
+                        appendSentence(activeTurnBlock, raw.replace("FINAL:", "").trim());
+                }
+            };
+
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            try {
+                const res = await fetch("/offer", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+                });
+                if (!res.ok) throw new Error("Failed to get answer");
+                const answer = await res.json();
+                await pc.setRemoteDescription(new RTCSessionDescription(answer));
+            } catch (err) {
+                setStatus('Failed to connect to server', true);
+                stop();
+            }
+
+            pc.onconnectionstatechange = () => {
+                if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) stop();
+            };
+        }
+
+        toggleBtn.onclick = () => { if (pc) stop(); else start(); };
+    </script>
+</body>
+
+</html>
