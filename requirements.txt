@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+aiortc
+av
+python-dotenv
+websockets
+deepgram-sdk
+speechmatics-python
