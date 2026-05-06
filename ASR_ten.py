@@ -68,7 +68,8 @@ class BaseTranscriptionHandler(ABC):
         joined = []
         for i, part in enumerate(parts):
             if i > 0 and joined and joined[-1][-1] not in SENTENCE_END:
-                joined[-1] += "."
+                # joined[-1] += "."
+                pass
             joined.append(part)
         full_text = " ".join(joined).strip()
         self._turn_finals.clear()
@@ -169,11 +170,17 @@ class SpeechmaticsHandler(BaseTranscriptionHandler):
         async with AsyncClient(api_key=KEYS["speechmatics"]) as client:
             @client.on(ServerMessageType.ADD_PARTIAL_TRANSCRIPT)
             def on_partial(msg):
-                asyncio.create_task(self.send_text(MSG_PARTIAL, msg["metadata"]["transcript"]))
+                partial_text = msg["metadata"]["transcript"].strip()
+                full_text = " ".join(self._turn_finals + [partial_text]).strip()
+                asyncio.create_task(self.send_text(MSG_PARTIAL, full_text))
 
             @client.on(ServerMessageType.ADD_TRANSCRIPT)
             def on_final(msg):
-                asyncio.create_task(self.send_text(MSG_FINAL, msg["metadata"]["transcript"]))
+                text = msg["metadata"]["transcript"].strip()
+                if text:
+                    self._turn_finals.append(text)
+                    full_text = " ".join(self._turn_finals).strip()
+                    asyncio.create_task(self.send_text(MSG_PARTIAL, full_text))
 
             await client.start_session(
                 transcription_config=TranscriptionConfig(language="en", enable_partials=True),
@@ -211,7 +218,7 @@ class AssemblyAIHandler(BaseTranscriptionHandler):
 
             recv_task = asyncio.create_task(receiver())
             buffer = bytearray()
-            MIN_CHUNK_SIZE = 2000
+            MIN_CHUNK_SIZE = PCM_SAMPLE_RATE * 2 // 2  # 0.5 seconds of audio (16-bit mono)
 
             try:
                 async for chunk in self.get_audio_chunks():
@@ -282,7 +289,7 @@ async def websocket_transcribe(websocket: WebSocket):
     await websocket.accept()
     log.info("WebSocket client connected")
 
-    provider = "assemblyai"
+    provider = "assemblyai"  # default provider
     handler = None
 
     try:
@@ -333,4 +340,4 @@ async def index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=9800)
+    uvicorn.run(app, host="0.0.0.0", port=9800, ssl_keyfile="192.168.100.2-key.pem", ssl_certfile="192.168.100.2.pem")
