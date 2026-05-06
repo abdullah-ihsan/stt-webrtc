@@ -58,6 +58,7 @@ class BaseTranscriptionHandler(ABC):
         self._task: asyncio.Task | None = None
         self._closed = False
         self._turn_finals: list[str] = []
+        self._latest_partial: str = ""
         self._stop_requested = asyncio.Event()
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
         self.session_id = id(websocket)
@@ -77,6 +78,10 @@ class BaseTranscriptionHandler(ABC):
 
         SENTENCE_END = {".", "!", "?"}
         parts = [s.strip() for s in self._turn_finals if s.strip()]
+        if self._latest_partial.strip():
+            parts.append(self._latest_partial.strip())
+            self._latest_partial = ""
+
         joined = []
         for i, part in enumerate(parts):
             if i > 0 and joined and joined[-1][-1] not in SENTENCE_END:
@@ -133,6 +138,9 @@ class BaseTranscriptionHandler(ABC):
             return
         if prefix == MSG_FINAL:
             self._turn_finals.append(text.strip())
+            self._latest_partial = ""
+        elif prefix == MSG_PARTIAL:
+            self._latest_partial = text.strip()
 
         try:
             payload = json.dumps({"type": prefix.lower(), "text": text.strip()})
@@ -203,16 +211,13 @@ class SpeechmaticsHandler(BaseTranscriptionHandler):
             @client.on(ServerMessageType.ADD_PARTIAL_TRANSCRIPT)
             def on_partial(msg):
                 partial_text = msg["metadata"]["transcript"].strip()
-                full_text = " ".join(self._turn_finals + [partial_text]).strip()
-                asyncio.create_task(self.send_text(MSG_PARTIAL, full_text))
+                asyncio.create_task(self.send_text(MSG_PARTIAL, partial_text))
 
             @client.on(ServerMessageType.ADD_TRANSCRIPT)
             def on_final(msg):
                 text = msg["metadata"]["transcript"].strip()
                 if text:
-                    self._turn_finals.append(text)
-                    full_text = " ".join(self._turn_finals).strip()
-                    asyncio.create_task(self.send_text(MSG_PARTIAL, full_text))
+                    asyncio.create_task(self.send_text(MSG_FINAL, text))
 
             await client.start_session(
                 transcription_config=TranscriptionConfig(language="en", enable_partials=True),
