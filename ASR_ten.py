@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator
 
@@ -9,13 +10,26 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
+from langchain_core.messages import HumanMessage, AIMessage
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("ws-transcription")
+log = logging.getLogger("carebuddy-ws")
 
-app = FastAPI(title="WebSocket Transcription")
+app = FastAPI(title="CareBuddy Live")
 
+# ====================== MAYA IMPORT ======================
+sys.path.append(".")
+from llm_layer import build_navigator, initial_greeting
+
+graph = build_navigator()
+config = {"configurable": {"thread_id": "carebuddy_main"}}
+
+initial_message = initial_greeting("This is the first conversation.")
+active_sessions = {}
+
+# ====================== TRANSCRIPTION CONFIG ======================
 KEYS = {
     "speechmatics": os.getenv("SPEECHMATICS_API_KEY"),
     "assemblyai": os.getenv("ASSEMBLYAI_API_KEY"),
@@ -26,10 +40,8 @@ PCM_SAMPLE_RATE = 16000
 MSG_PARTIAL = "PARTIAL"
 MSG_FINAL = "FINAL"
 
-# AssemblyAI
-AAI_MODEL         = "u3-rt-pro"
-AAI_EOT_THRESHOLD = 0.4     # end-of-turn confidence; lower = faster turn detection
-
+AAI_MODEL = "u3-rt-pro"
+AAI_EOT_THRESHOLD = 0.4
 AAI_WS_URL = (
     f"wss://streaming.assemblyai.com/v3/ws"
     f"?speech_model={AAI_MODEL}"
@@ -39,9 +51,7 @@ AAI_WS_URL = (
     f"&end_of_turn_confidence_threshold={AAI_EOT_THRESHOLD}"
 )
 
-
-# ── Base Handler with Clean Lifecycle ────────────────────────────────────────
-
+# ====================== BASE HANDLER (with Maya) ======================
 class BaseTranscriptionHandler(ABC):
     def __init__(self, websocket: WebSocket):
         self.ws = websocket
@@ -50,6 +60,7 @@ class BaseTranscriptionHandler(ABC):
         self._turn_finals: list[str] = []
         self._stop_requested = asyncio.Event()
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
+        self.session_id = id(websocket)
 
     def handle_client_message(self, raw: str):
         try:
@@ -63,6 +74,7 @@ class BaseTranscriptionHandler(ABC):
     async def flush_turn(self):
         if self._closed:
             return
+
         SENTENCE_END = {".", "!", "?"}
         parts = [s.strip() for s in self._turn_finals if s.strip()]
         joined = []
@@ -71,21 +83,54 @@ class BaseTranscriptionHandler(ABC):
                 # joined[-1] += "."
                 pass
             joined.append(part)
+
         full_text = " ".join(joined).strip()
         self._turn_finals.clear()
 
-        if full_text:
-            try:
-                payload = json.dumps({"type": "turn_complete", "text": full_text})
-                await self.ws.send_text(payload)
-                log.info(f"✅ Turn complete sent: {full_text[:80]}...")
-            except:
-                self._closed = True
+        if not full_text:
+            return
+
+        try:
+            # Send turn complete to frontend
+            await self.ws.send_text(json.dumps({"type": "turn_complete", "text": full_text}))
+            log.info(f"✅ Turn complete sent: {full_text[:80]}...")
+
+            # === CALL MAYA ===
+            session = active_sessions.get(self.session_id)
+            if session:
+                result = graph.invoke({
+                    "messages": [HumanMessage(content=full_text)],
+                    "known_info": session.get("known_info", {"topic_completion": {}}),
+                    "current_topic": session.get("current_topic", "Initial rapport & check-in"),
+                    "emotional_tone": session.get("emotional_tone", "neutral"),
+                    "visited_topics": session.get("visited_topics", [])
+                }, config=config)
+
+                ai_reply = result['messages'][-1].content
+
+                # Update session
+                session.setdefault("messages", []).extend([
+                    HumanMessage(content=full_text),
+                    AIMessage(content=ai_reply)
+                ])
+                session["known_info"] = result.get("known_info", session.get("known_info"))
+                session["current_topic"] = result.get("current_topic")
+                session["emotional_tone"] = result.get("emotional_tone")
+                session["visited_topics"] = result.get("visited_topics", [])
+
+                # Send AI response
+                await self.ws.send_text(json.dumps({
+                    "type": "ai_response",
+                    "text": ai_reply
+                }))
+                log.info(f"🤖 Maya replied: {ai_reply[:80]}...")
+
+        except Exception as e:
+            log.error(f"Error in flush_turn + Maya: {e}", exc_info=True)
 
     async def send_text(self, prefix: str, text: str):
         if not text or not text.strip() or self._closed:
             return
-
         if prefix == MSG_FINAL:
             self._turn_finals.append(text.strip())
 
@@ -96,13 +141,11 @@ class BaseTranscriptionHandler(ABC):
             log.warning(f"WS send failed: {e}")
             self._closed = True
 
-
     async def get_audio_chunks(self) -> AsyncGenerator[bytes, None]:
         while not self._closed:
             try:
                 chunk = await self._audio_queue.get()
-                if chunk is None:
-                    break
+                if chunk is None: break
                 yield chunk
             except:
                 break
@@ -112,7 +155,7 @@ class BaseTranscriptionHandler(ABC):
             try:
                 await self._audio_queue.put(data)
             except asyncio.QueueFull:
-                pass  # drop old chunks
+                pass
 
     @abstractmethod
     async def run(self):
@@ -125,24 +168,18 @@ class BaseTranscriptionHandler(ABC):
 
     async def _run_wrapper(self):
         try:
-            # Run transcription and wait for stop signal concurrently
             run_task = asyncio.create_task(self.run())
             stop_task = asyncio.create_task(self._stop_requested.wait())
-            done, pending = await asyncio.wait(
-                [run_task, stop_task], return_when=asyncio.FIRST_COMPLETED
-            )
+            done, pending = await asyncio.wait([run_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
                 try:
                     await t
                 except asyncio.CancelledError:
                     pass
-        except asyncio.CancelledError:
-            log.debug("Handler task cancelled")
         except Exception as e:
             log.error(f"Handler error: {e}", exc_info=True)
         finally:
-            # Flush whatever was accumulated in this turn before closing
             await self.flush_turn()
             await self.close()
 
@@ -150,9 +187,6 @@ class BaseTranscriptionHandler(ABC):
         if self._closed:
             return
         self._closed = True
-
-        log.info("Closing transcription handler")
-
         if self._task and not self._task.done():
             self._task.cancel()
             try:
@@ -161,12 +195,10 @@ class BaseTranscriptionHandler(ABC):
                 pass
 
 
-# ── Provider Handlers (Mostly Unchanged) ─────────────────────────────────────
-
+# ====================== PROVIDER HANDLERS ======================
 class SpeechmaticsHandler(BaseTranscriptionHandler):
     async def run(self):
         from speechmatics.rt import AsyncClient, AudioEncoding, AudioFormat, ServerMessageType, TranscriptionConfig
-
         async with AsyncClient(api_key=KEYS["speechmatics"]) as client:
             @client.on(ServerMessageType.ADD_PARTIAL_TRANSCRIPT)
             def on_partial(msg):
@@ -210,8 +242,6 @@ class AssemblyAIHandler(BaseTranscriptionHandler):
                             is_final = data.get("end_of_turn", False)
                             prefix = MSG_FINAL if is_final else MSG_PARTIAL
                             await self.send_text(prefix, data.get("transcript", ""))
-                        elif data.get("type") == "Error":
-                            log.error(f"AssemblyAI Error: {data.get('error')}")
                 except Exception as e:
                     if not self._closed:
                         log.error(f"AssemblyAI receiver failed: {e}")
@@ -245,7 +275,7 @@ class DeepgramHandler(BaseTranscriptionHandler):
         client = DeepgramClient(api_key=KEYS["deepgram"])
 
         with client.listen.v1.connect(
-            model="nova-3", encoding="linear16", sample_rate=PCM_SAMPLE_RATE
+            model="nova-3-medical", encoding="linear16", sample_rate=PCM_SAMPLE_RATE
         ) as conn:
 
             def on_message(message, **kwargs):
@@ -258,7 +288,7 @@ class DeepgramHandler(BaseTranscriptionHandler):
                         self.send_text(MSG_FINAL if is_final else MSG_PARTIAL, text), loop
                     )
                 except Exception as e:
-                    log.warning(f"Deepgram parse error: {e}")
+                    log.warning(f"Deepgram error: {e}")
 
             conn.on(EventType.MESSAGE, on_message)
             threading.Thread(target=conn.start_listening, daemon=True).start()
@@ -270,11 +300,9 @@ class DeepgramHandler(BaseTranscriptionHandler):
             finally:
                 try:
                     conn.send_close_stream()
-                except Exception:
+                except:
                     pass
 
-
-# ── Handler Registry ─────────────────────────────────────────────────────────
 
 HANDLERS = {
     "speechmatics": SpeechmaticsHandler,
@@ -283,31 +311,39 @@ HANDLERS = {
 }
 
 
-# ── WebSocket Endpoint (Robust) ─────────────────────────────────────────────
+# ====================== WEBSOCKET ENDPOINT ======================
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
     await websocket.accept()
-    log.info("WebSocket client connected")
+    log.info("Client connected")
 
-    provider = "assemblyai"  # default provider
     handler = None
+    session_id = id(websocket)
+
+    # Initialize session
+    active_sessions[session_id] = {
+        "messages": [AIMessage(content=initial_message)],
+        "known_info": {"topic_completion": {}},
+        "current_topic": "Initial rapport & check-in",
+        "emotional_tone": "neutral",
+        "visited_topics": []
+    }
 
     try:
-        # Get provider from first message
+        # Get provider
         try:
-            first_msg = await websocket.receive_text()
+            first_msg = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
             data = json.loads(first_msg)
-            provider = data.get("provider", "assemblyai").lower()
+            provider = data.get("provider", "speechmatics").lower()
         except:
-            pass
+            provider = "speechmatics"
+
         if provider not in HANDLERS:
-            provider = "assemblyai"
+            provider = "speechmatics"
 
-        log.info(f"WebSocket using provider: {provider}")
+        log.info(f"Using provider: {provider}")
 
-        # Create handler
-        handler = HANDLERS[provider](websocket)   # ← This is the correct call now
-
+        handler = HANDLERS[provider](websocket)
         await handler.start()
 
         while not handler._closed:
@@ -328,9 +364,10 @@ async def websocket_transcribe(websocket: WebSocket):
     except Exception as e:
         log.error(f"WebSocket error: {e}", exc_info=True)
     finally:
+        if session_id in active_sessions:
+            active_sessions.pop(session_id, None)
         if handler:
             await handler.close()
-        log.info("WebSocket connection closed")
 
 
 @app.get("/")

@@ -6,4 +6,8 @@ python-dotenv
 websockets
 deepgram-sdk
 speechmatics-python
-websockets
+langchain>=1.2.0,<2.0.0
+langchain-core>=1.2.0,<2.0.0
+langgraph>=1.0.0,<2.0.0
+langgraph-checkpoint>=3.0.0,<4.0.0
+langchain_ollama

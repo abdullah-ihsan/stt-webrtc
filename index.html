@@ -1,10 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebRTC Transcription</title>
+    <title>CareBuddy - Live Transcription</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -58,18 +57,20 @@
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 12px;
         }
 
-        /* ── Turn block ────────────────────────────── */
         .turn-block {
             border: 1.5px solid #e2e8f0;
             border-radius: 8px;
             overflow: hidden;
             flex-shrink: 0;
         }
+        .turn-block.ai {
+            border-color: #6366f1;
+            background: #f0f9ff;
+        }
 
-        /* Header bar */
         .turn-header {
             display: flex;
             align-items: center;
@@ -84,13 +85,9 @@
             border-bottom: 1px solid #e2e8f0;
         }
 
-        .turn-block.live .turn-header {
-            background: #fef2f2;
-            color: #ef4444;
-            border-color: #fecaca;
-        }
+        .turn-block.live .turn-header { background: #fef2f2; color: #ef4444; }
+        .turn-block.ai .turn-header { background: #e0e7ff; color: #4f46e5; }
 
-        /* Animated recording dot */
         .turn-dot {
             width: 7px;
             height: 7px;
@@ -100,6 +97,7 @@
         }
         .turn-block.live  .turn-dot { background: #ef4444; animation: pulse 1s infinite; }
         .turn-block.done  .turn-dot { background: #22c55e; }
+        .turn-block.ai .turn-dot { background: #6366f1; }
 
         @keyframes pulse {
             0%, 100% { opacity: 1; }
@@ -127,6 +125,7 @@
             display: block;
             color: #94a3b8;
             margin-top: 4px;
+            font-style: italic;
         }
 
         /* ── Loose info / error lines ──────────────── */
@@ -134,7 +133,6 @@
         .error-line { color: #b91c1c; font-size: 0.88em; padding: 2px 4px; }
     </style>
 </head>
-
 <body>
     <h1>CareBuddy - Live Transcription</h1>
     <p>Click Start Turn to begin speaking. Click End Turn to stop and send.</p>
@@ -153,12 +151,9 @@
         let activeTurnBlock = null;
         let turnCounter = 0;
 
-
-        const toggleBtn    = document.getElementById('toggleBtn');
-        const statusEl     = document.getElementById('status');
+        const toggleBtn = document.getElementById('toggleBtn');
+        const statusEl = document.getElementById('status');
         const transcriptEl = document.getElementById('transcript');
-
-        // ── UI helpers ───────────────────────────────
 
         function setStatus(text, isError = false) {
             statusEl.textContent = "Status: " + text;
@@ -169,7 +164,6 @@
             transcriptEl.scrollTop = transcriptEl.scrollHeight;
         }
 
-        /** Spin up a new live turn card */
         function createTurnBlock() {
             turnCounter++;
             const block = document.createElement('div');
@@ -177,30 +171,46 @@
 
             const header = document.createElement('div');
             header.className = 'turn-header';
+            const dot = document.createElement('span'); dot.className = 'turn-dot';
+            const label = document.createElement('span'); label.textContent = `Turn ${turnCounter}`;
 
-            const dot = document.createElement('span');
-            dot.className = 'turn-dot';
+            header.appendChild(dot); header.appendChild(label);
 
-            const label = document.createElement('span');
-            label.textContent = `Turn ${turnCounter}`;
+            const body = document.createElement('div'); body.className = 'turn-body';
 
-            header.appendChild(dot);
-            header.appendChild(label);
-
-            const body = document.createElement('div');
-            body.className = 'turn-body';
-
-            block.appendChild(header);
-            block.appendChild(body);
+            block.appendChild(header); block.appendChild(body);
             transcriptEl.appendChild(block);
             scrollBottom();
             return block;
         }
 
-        /** Add a committed sentence line to a turn block */
+        function createAIMessageBlock(text) {
+            const block = document.createElement('div');
+            block.className = 'turn-block ai';
+
+            const header = document.createElement('div');
+            header.className = 'turn-header';
+            const dot = document.createElement('span'); dot.className = 'turn-dot';
+            const label = document.createElement('span'); label.textContent = 'CareBuddy';
+
+            header.appendChild(dot); header.appendChild(label);
+
+            const body = document.createElement('div');
+            body.className = 'turn-body';
+            const span = document.createElement('span');
+            span.className = 'sentence';
+            span.textContent = text;
+
+            body.appendChild(span);
+            block.appendChild(header);
+            block.appendChild(body);
+
+            transcriptEl.appendChild(block);
+            scrollBottom();
+        }
+
         function appendSentence(block, text) {
             const body = block.querySelector('.turn-body');
-            // Drop the trailing partial
             const partial = body.querySelector('.partial-line');
             if (partial) partial.remove();
 
@@ -211,7 +221,6 @@
             scrollBottom();
         }
 
-        /** Show / update the grey partial preview inside the active block */
         function upsertPartial(block, text) {
             const body = block.querySelector('.turn-body');
             let partial = body.querySelector('.partial-line');
@@ -224,70 +233,56 @@
             scrollBottom();
         }
 
-        /** Seal the block: green dot, replace body with the authoritative full text */
         function sealTurnBlock(block, fullText) {
             block.classList.remove('live');
             block.classList.add('done');
-
             const body = block.querySelector('.turn-body');
-            body.innerHTML = '';
-
-            const span = document.createElement('span');
-            span.className = 'sentence';
-            span.textContent = fullText;
-            body.appendChild(span);
+            body.innerHTML = `<span class="sentence">${fullText}</span>`;
             scrollBottom();
         }
 
-        function addLooseLine(text, cls) {
-            const div = document.createElement('div');
-            div.className = cls;
-            div.textContent = text;
-            transcriptEl.appendChild(div);
-            scrollBottom();
-        }
+        // Improved End Turn Logic
+        async function endCurrentTurn() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-        async function stop() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                try {
-                    ws.send(JSON.stringify({ type: "stop" }));   // Tell server to flush
-                    await new Promise(r => setTimeout(r, 800)); // Give time for flush_turn
-                } catch (_) {}
+            setStatus('Ending turn...');
+
+            try {
+                ws.send(JSON.stringify({ type: "stop" }));
+                // Give backend time to process flush_turn + CareBuddy
+                await new Promise(r => setTimeout(r, 1200));
+            } catch (e) {
+                console.error("Error sending stop", e);
             }
 
+            // Now safely cleanup audio
             if (processor) { processor.disconnect(); processor = null; }
-            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-            if (audioContext) { await audioContext.close().catch(() => {}); audioContext = null; }
-            if (ws) { ws.close(); ws = null; }
+            if (mediaStream) { 
+                mediaStream.getTracks().forEach(t => t.stop()); 
+                mediaStream = null; 
+            }
+            if (audioContext) { 
+                await audioContext.close().catch(() => {}); 
+                audioContext = null; 
+            }
 
             toggleBtn.textContent = 'Start Turn';
             toggleBtn.classList.remove('recording');
-            setStatus('Stopped');
         }
 
-
-        // ── Audio Streaming ─────────────────────────────────────
         async function startStreaming() {
             mediaStream = await navigator.mediaDevices.getUserMedia({
-                audio: { 
-                    echoCancellation: true, 
-                    noiseSuppression: true, 
-                    autoGainControl: true,
-                    sampleRate: 16000
-                }
+                audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, sampleRate: 16000 }
             });
 
             audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-
             const source = audioContext.createMediaStreamSource(mediaStream);
             processor = audioContext.createScriptProcessor(4096, 1, 1);
 
             processor.onaudioprocess = (e) => {
                 if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
                 const inputData = e.inputBuffer.getChannelData(0);
                 const pcm16 = new Int16Array(inputData.length);
-
                 for (let i = 0; i < inputData.length; i++) {
                     pcm16[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
                 }
@@ -298,20 +293,14 @@
             processor.connect(audioContext.destination);
         }
 
-        // ── Main Start Function ─────────────────────────────────
         async function start() {
             setStatus('Connecting...');
-
             try {
                 ws = new WebSocket(`wss://${window.location.host}/ws/transcribe`);
 
                 ws.onopen = async () => {
-                    // You can change provider here
-                    // ws.send(JSON.stringify({ provider: "assemblyai" })); 
-
                     await startStreaming();
-
-                    setStatus('Streaming - Speak now');
+                    setStatus('🎤 Speaking - Press End Turn when done');
                     toggleBtn.textContent = 'End Turn';
                     toggleBtn.classList.add('recording');
                     activeTurnBlock = createTurnBlock();
@@ -322,45 +311,55 @@
                         const data = JSON.parse(event.data);
                         const type = data.type?.toLowerCase();
                         const text = data.text?.trim();
-                        console.log("Received message", { type, text });
 
                         switch (type) {
                             case "partial":
                                 if (text && activeTurnBlock) upsertPartial(activeTurnBlock, text);
                                 break;
-
                             case "final":
                                 if (text && activeTurnBlock) appendSentence(activeTurnBlock, text);
                                 break;
-
                             case "turn_complete":
                                 if (activeTurnBlock) {
                                     sealTurnBlock(activeTurnBlock, text || '(no speech detected)');
                                     activeTurnBlock = null;
                                 }
-                                setStatus('Turn complete — ready for next turn');
+                                setStatus('CareBuddy is thinking...');
                                 break;
-
+                            case "ai_response":
+                                createAIMessageBlock(text);
+                                setStatus('Ready - Click Start Turn to speak again');
+                                break;
                             case "error":
-                                if (text) addLooseLine(text, 'error-line');
+                                console.error("Backend error:", text);
                                 break;
                         }
                     } catch (e) {
-                        console.error("Message parse error", e);
+                        console.error("Parse error", e);
                     }
                 };
 
-                ws.onclose = () => stop();
+                ws.onclose = () => {
+                    console.log("WebSocket closed");
+                    toggleBtn.textContent = 'Start Turn';
+                    toggleBtn.classList.remove('recording');
+                };
+
                 ws.onerror = () => setStatus('Connection error', true);
 
             } catch (err) {
-                setStatus('Failed to connect to server', true);
-                stop();
+                setStatus('Failed to connect', true);
             }
         }
 
-        toggleBtn.onclick = () => { if (ws) stop(); else start(); };
+        // Button Handler
+        toggleBtn.onclick = async () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                await endCurrentTurn();
+            } else {
+                await start();
+            }
+        };
     </script>
 </body>
-
 </html>
