@@ -1,14 +1,17 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import sys
+import uuid
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from livekit import api, rtc
 
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -24,10 +27,10 @@ sys.path.append(".")
 from llm_layer import build_navigator, initial_greeting
 
 graph = build_navigator()
-config = {"configurable": {"thread_id": "carebuddy_main"}}
 
 initial_message = initial_greeting("This is the first conversation.")
 active_sessions = {}
+livekit_sessions = {}
 
 # ====================== TRANSCRIPTION CONFIG ======================
 KEYS = {
@@ -39,6 +42,8 @@ KEYS = {
 PCM_SAMPLE_RATE = 16000
 MSG_PARTIAL = "PARTIAL"
 MSG_FINAL = "FINAL"
+LIVEKIT_EVENTS_TOPIC = "carebuddy.events"
+LIVEKIT_CONTROL_TOPIC = "carebuddy.control"
 
 AAI_MODEL = "u3-rt-pro"
 AAI_EOT_THRESHOLD = 0.4
@@ -53,15 +58,16 @@ AAI_WS_URL = (
 
 # ====================== BASE HANDLER (with Maya) ======================
 class BaseTranscriptionHandler(ABC):
-    def __init__(self, websocket: WebSocket):
-        self.ws = websocket
+    def __init__(self, transport):
+        self.ws = transport
         self._task: asyncio.Task | None = None
         self._closed = False
         self._turn_finals: list[str] = []
         self._latest_partial: str = ""
         self._stop_requested = asyncio.Event()
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
-        self.session_id = id(websocket)
+        self.session_id = id(transport)
+        self.config = {"configurable": {"thread_id": f"carebuddy_{self.session_id}"}}
 
     def handle_client_message(self, raw: str):
         try:
@@ -109,7 +115,7 @@ class BaseTranscriptionHandler(ABC):
                     "current_topic": session.get("current_topic", "Initial rapport & check-in"),
                     "emotional_tone": session.get("emotional_tone", "neutral"),
                     "visited_topics": session.get("visited_topics", [])
-                }, config=config)
+                }, config=self.config)
 
                 ai_reply = result['messages'][-1].content
 
@@ -153,7 +159,8 @@ class BaseTranscriptionHandler(ABC):
         while not self._closed:
             try:
                 chunk = await self._audio_queue.get()
-                if chunk is None: break
+                if chunk is None:
+                    break
                 yield chunk
             except:
                 break
@@ -195,7 +202,7 @@ class BaseTranscriptionHandler(ABC):
         if self._closed:
             return
         self._closed = True
-        if self._task and not self._task.done():
+        if self._task and not self._task.done() and self._task is not asyncio.current_task():
             self._task.cancel()
             try:
                 await self._task
@@ -316,6 +323,235 @@ HANDLERS = {
 }
 
 
+def new_session_state():
+    return {
+        "messages": [AIMessage(content=initial_message)],
+        "known_info": {"topic_completion": {}},
+        "current_topic": "Initial rapport & check-in",
+        "emotional_tone": "neutral",
+        "visited_topics": []
+    }
+
+
+def create_livekit_token(
+    *,
+    identity: str,
+    room_name: str,
+    display_name: str,
+    can_publish: bool,
+    can_subscribe: bool,
+) -> str:
+    livekit_url = os.getenv("LIVEKIT_URL")
+    api_key = os.getenv("LIVEKIT_API_KEY")
+    api_secret = os.getenv("LIVEKIT_API_SECRET")
+
+    if not livekit_url or not api_key or not api_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET must be set.",
+        )
+
+    return (
+        api.AccessToken(api_key, api_secret)
+        .with_identity(identity)
+        .with_name(display_name)
+        .with_grants(
+            api.VideoGrants(
+                room_join=True,
+                room=room_name,
+                can_publish=can_publish,
+                can_subscribe=can_subscribe,
+                can_publish_data=True,
+            )
+        )
+        .to_jwt()
+    )
+
+
+class LiveKitDataTransport:
+    def __init__(self, room: rtc.Room):
+        self.room = room
+        self.destination_identity: str | None = None
+
+    async def send_text(self, payload: str):
+        destinations = [self.destination_identity] if self.destination_identity else []
+        await self.room.local_participant.publish_data(
+            payload,
+            reliable=True,
+            destination_identities=destinations,
+            topic=LIVEKIT_EVENTS_TOPIC,
+        )
+
+
+class LiveKitSessionBridge:
+    def __init__(self, room_name: str, provider: str):
+        self.room_name = room_name
+        self.provider = provider if provider in HANDLERS else "speechmatics"
+        self.identity = f"carebuddy-server-{uuid.uuid4().hex[:8]}"
+        self.room = rtc.Room()
+        self.transport = LiveKitDataTransport(self.room)
+        self.session_id = id(self.transport)
+        self.handler: BaseTranscriptionHandler | None = None
+        self.turn_active = False
+        self.closed = False
+        self.initial_sent = False
+        self.audio_tasks: dict[str, asyncio.Task] = {}
+
+        active_sessions[self.session_id] = new_session_state()
+        self._register_room_events()
+
+    def _register_room_events(self):
+        @self.room.on("participant_connected")
+        def on_participant_connected(participant: rtc.RemoteParticipant):
+            if participant.identity != self.identity:
+                self.transport.destination_identity = participant.identity
+                asyncio.create_task(self._send_initial_message())
+                log.info("LiveKit participant connected: %s", participant.identity)
+
+        @self.room.on("participant_disconnected")
+        def on_participant_disconnected(participant: rtc.RemoteParticipant):
+            if participant.identity == self.transport.destination_identity:
+                asyncio.create_task(self.close())
+
+        @self.room.on("track_subscribed")
+        def on_track_subscribed(
+            track: rtc.Track,
+            publication: rtc.RemoteTrackPublication,
+            participant: rtc.RemoteParticipant,
+        ):
+            if track.kind != rtc.TrackKind.KIND_AUDIO:
+                return
+            if participant.identity == self.identity:
+                return
+            self.transport.destination_identity = participant.identity
+            task = asyncio.create_task(self._consume_audio(track, publication.sid))
+            self.audio_tasks[publication.sid] = task
+            task.add_done_callback(lambda _task: self.audio_tasks.pop(publication.sid, None))
+            asyncio.create_task(self._send_initial_message())
+            log.info("Subscribed to LiveKit audio track %s from %s", publication.sid, participant.identity)
+
+        @self.room.on("data_received")
+        def on_data_received(packet: rtc.DataPacket):
+            if packet.topic and packet.topic != LIVEKIT_CONTROL_TOPIC:
+                return
+            if packet.participant:
+                self.transport.destination_identity = packet.participant.identity
+            try:
+                message = json.loads(packet.data.decode("utf-8"))
+            except Exception:
+                log.warning("Ignoring invalid LiveKit control packet")
+                return
+
+            msg_type = message.get("type")
+            if msg_type == "start":
+                asyncio.create_task(self.start_turn())
+            elif msg_type == "stop":
+                asyncio.create_task(self.stop_turn())
+
+    async def connect(self):
+        livekit_url = os.getenv("LIVEKIT_URL")
+        token = create_livekit_token(
+            identity=self.identity,
+            room_name=self.room_name,
+            display_name="CareBuddy Server",
+            can_publish=False,
+            can_subscribe=True,
+        )
+        await self.room.connect(livekit_url, token)
+        log.info("CareBuddy LiveKit bridge connected to room %s", self.room_name)
+
+    async def _send_initial_message(self):
+        if self.initial_sent or not self.transport.destination_identity:
+            return
+        self.initial_sent = True
+        await self.transport.send_text(json.dumps({"type": "ai_response", "text": initial_message}))
+
+    async def start_turn(self):
+        if self.closed:
+            return
+        self.turn_active = True
+        if self.handler and not self.handler._closed:
+            return
+
+        self.handler = HANDLERS[self.provider](self.transport)
+        await self.handler.start()
+        log.info("Started LiveKit transcription turn using provider: %s", self.provider)
+
+    async def stop_turn(self):
+        self.turn_active = False
+        if not self.handler or self.handler._closed:
+            return
+        self.handler.handle_client_message(json.dumps({"type": "stop"}))
+
+    async def _consume_audio(self, track: rtc.Track, publication_sid: str):
+        stream = rtc.AudioStream(track, sample_rate=PCM_SAMPLE_RATE, num_channels=1)
+        try:
+            async for event in stream:
+                if self.closed:
+                    break
+                if not self.turn_active or not self.handler or self.handler._closed:
+                    continue
+                await self.handler.put_audio(event.frame.data.tobytes())
+        except Exception as e:
+            if not self.closed:
+                log.error("LiveKit audio stream failed for %s: %s", publication_sid, e, exc_info=True)
+        finally:
+            with contextlib.suppress(Exception):
+                await stream.aclose()
+
+    async def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.turn_active = False
+        for task in list(self.audio_tasks.values()):
+            task.cancel()
+        if self.audio_tasks:
+            await asyncio.gather(*self.audio_tasks.values(), return_exceptions=True)
+        if self.handler:
+            await self.handler.close()
+        active_sessions.pop(self.session_id, None)
+        livekit_sessions.pop(self.room_name, None)
+        if self.room.isconnected():
+            await self.room.disconnect()
+        log.info("Closed LiveKit bridge for room %s", self.room_name)
+
+
+@app.get("/livekit/session")
+async def livekit_session(provider: str = Query("speechmatics")):
+    provider = provider.lower()
+    if provider not in HANDLERS:
+        provider = "speechmatics"
+
+    room_name = f"carebuddy-{uuid.uuid4().hex[:12]}"
+    participant_identity = f"patient-{uuid.uuid4().hex[:8]}"
+    bridge = LiveKitSessionBridge(room_name, provider)
+
+    try:
+        await bridge.connect()
+    except Exception as e:
+        active_sessions.pop(bridge.session_id, None)
+        log.error("Failed to start LiveKit bridge: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to connect LiveKit bridge: {e}")
+
+    livekit_sessions[room_name] = bridge
+    token = create_livekit_token(
+        identity=participant_identity,
+        room_name=room_name,
+        display_name="Patient",
+        can_publish=True,
+        can_subscribe=True,
+    )
+
+    return {
+        "url": os.getenv("LIVEKIT_URL"),
+        "token": token,
+        "room": room_name,
+        "identity": participant_identity,
+        "provider": provider,
+    }
+
+
 # ====================== WEBSOCKET ENDPOINT ======================
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
@@ -326,13 +562,7 @@ async def websocket_transcribe(websocket: WebSocket):
     session_id = id(websocket)
 
     # Initialize session
-    active_sessions[session_id] = {
-        "messages": [AIMessage(content=initial_message)],
-        "known_info": {"topic_completion": {}},
-        "current_topic": "Initial rapport & check-in",
-        "emotional_tone": "neutral",
-        "visited_topics": []
-    }
+    active_sessions[session_id] = new_session_state()
 
     try:
         # Get provider
@@ -382,4 +612,5 @@ async def index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=9800, ssl_keyfile="192.168.100.2-key.pem", ssl_certfile="192.168.100.2.pem")
+    # uvicorn.run(app, host="0.0.0.0", port=9800, ssl_keyfile="192.168.100.2-key.pem", ssl_certfile="192.168.100.2.pem")
+    uvicorn.run(app, host="0.0.0.0", port=9800)

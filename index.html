@@ -24,16 +24,30 @@
             margin-bottom: 14px;
         }
 
-        button {
-            padding: 10px 18px;
-            font-size: 15px;
+        button,
+        select {
+            height: 40px;
             border-radius: 6px;
             border: 1px solid #1e3a8a;
+            font-size: 15px;
+        }
+
+        button {
+            padding: 0 18px;
             cursor: pointer;
             background: #1e3a8a;
             color: #fff;
         }
-        button:disabled { opacity: 0.45; cursor: default; }
+
+        select {
+            min-width: 160px;
+            padding: 0 10px;
+            background: #fff;
+            color: #1e293b;
+        }
+
+        button:disabled,
+        select:disabled { opacity: 0.45; cursor: default; }
         #toggleBtn.recording { background: #dc2626; border-color: #dc2626; }
 
         #status {
@@ -47,7 +61,6 @@
         }
         #status.error { background: #fee2e2; color: #b91c1c; }
 
-        /* ── Transcript container ──────────────────── */
         #transcript {
             background: #fff;
             border: 1.5px solid #e2e8f0;
@@ -101,10 +114,9 @@
 
         @keyframes pulse {
             0%, 100% { opacity: 1; }
-            50%       { opacity: 0.3; }
+            50% { opacity: 0.3; }
         }
 
-        /* Body */
         .turn-body {
             padding: 12px 14px;
             font-size: 1em;
@@ -112,7 +124,6 @@
             color: #1e293b;
         }
 
-        /* Each committed sentence sits on its own line */
         .sentence {
             display: block;
         }
@@ -120,7 +131,6 @@
             margin-top: 3px;
         }
 
-        /* Partial preview — greyed out, at the bottom */
         .partial-line {
             display: block;
             color: #94a3b8;
@@ -128,8 +138,6 @@
             font-style: italic;
         }
 
-        /* ── Loose info / error lines ──────────────── */
-        .info-line  { color: #0369a1; font-style: italic; font-size: 0.88em; padding: 2px 4px; }
         .error-line { color: #b91c1c; font-size: 0.88em; padding: 2px 4px; }
     </style>
 </head>
@@ -138,20 +146,29 @@
     <p>Click Start Turn to begin speaking. Click End Turn to stop and send.</p>
 
     <div class="controls">
+        <select id="providerSelect" aria-label="Speech-to-text provider">
+            <option value="speechmatics">Speechmatics</option>
+            <option value="assemblyai">AssemblyAI</option>
+            <option value="deepgram">Deepgram</option>
+        </select>
         <button id="toggleBtn">Start Turn</button>
     </div>
 
     <div id="status">Status: Ready</div>
     <div id="transcript"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
     <script>
-        let ws = null;
-        let audioContext = null;
-        let mediaStream = null;
-        let processor = null;
+        let room = null;
         let activeTurnBlock = null;
         let turnCounter = 0;
+        let isRecording = false;
 
+        const LK = window.LivekitClient;
+        const encoder = new TextEncoder();
+        const decoder = new TextDecoder();
         const toggleBtn = document.getElementById('toggleBtn');
+        const providerSelect = document.getElementById('providerSelect');
         const statusEl = document.getElementById('status');
         const transcriptEl = document.getElementById('transcript');
 
@@ -171,14 +188,19 @@
 
             const header = document.createElement('div');
             header.className = 'turn-header';
-            const dot = document.createElement('span'); dot.className = 'turn-dot';
-            const label = document.createElement('span'); label.textContent = `Turn ${turnCounter}`;
+            const dot = document.createElement('span');
+            dot.className = 'turn-dot';
+            const label = document.createElement('span');
+            label.textContent = `Turn ${turnCounter}`;
 
-            header.appendChild(dot); header.appendChild(label);
+            header.appendChild(dot);
+            header.appendChild(label);
 
-            const body = document.createElement('div'); body.className = 'turn-body';
+            const body = document.createElement('div');
+            body.className = 'turn-body';
 
-            block.appendChild(header); block.appendChild(body);
+            block.appendChild(header);
+            block.appendChild(body);
             transcriptEl.appendChild(block);
             scrollBottom();
             return block;
@@ -190,10 +212,13 @@
 
             const header = document.createElement('div');
             header.className = 'turn-header';
-            const dot = document.createElement('span'); dot.className = 'turn-dot';
-            const label = document.createElement('span'); label.textContent = 'CareBuddy';
+            const dot = document.createElement('span');
+            dot.className = 'turn-dot';
+            const label = document.createElement('span');
+            label.textContent = 'CareBuddy';
 
-            header.appendChild(dot); header.appendChild(label);
+            header.appendChild(dot);
+            header.appendChild(label);
 
             const body = document.createElement('div');
             body.className = 'turn-body';
@@ -237,129 +262,165 @@
             block.classList.remove('live');
             block.classList.add('done');
             const body = block.querySelector('.turn-body');
-            body.innerHTML = `<span class="sentence">${fullText}</span>`;
+            body.innerHTML = '';
+            const span = document.createElement('span');
+            span.className = 'sentence';
+            span.textContent = fullText;
+            body.appendChild(span);
             scrollBottom();
         }
 
-        // Improved End Turn Logic
-        async function endCurrentTurn() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        function appendError(text) {
+            const line = document.createElement('div');
+            line.className = 'error-line';
+            line.textContent = text;
+            transcriptEl.appendChild(line);
+            scrollBottom();
+        }
 
+        function handleServerEvent(data) {
+            const type = data.type?.toLowerCase();
+            const text = data.text?.trim();
+
+            switch (type) {
+                case "partial":
+                    if (text && activeTurnBlock) upsertPartial(activeTurnBlock, text);
+                    break;
+                case "final":
+                    if (text && activeTurnBlock) appendSentence(activeTurnBlock, text);
+                    break;
+                case "turn_complete":
+                    if (activeTurnBlock) {
+                        sealTurnBlock(activeTurnBlock, text || '(no speech detected)');
+                        activeTurnBlock = null;
+                    }
+                    setStatus('CareBuddy is thinking...');
+                    break;
+                case "ai_response":
+                    if (text) createAIMessageBlock(text);
+                    setStatus(isRecording ? 'Speaking' : 'Ready');
+                    break;
+                case "error":
+                    appendError(text || 'Backend error');
+                    break;
+            }
+        }
+
+        async function connectRoom() {
+            if (!LK) {
+                throw new Error('LiveKit browser SDK did not load');
+            }
+
+            const provider = providerSelect.value;
+            const response = await fetch(`/livekit/session?provider=${encodeURIComponent(provider)}`);
+            if (!response.ok) {
+                const detail = await response.text();
+                throw new Error(detail || 'Unable to create LiveKit session');
+            }
+
+            const session = await response.json();
+            room = new LK.Room();
+
+            room.on(LK.RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+                if (topic && topic !== 'carebuddy.events') return;
+                try {
+                    handleServerEvent(JSON.parse(decoder.decode(payload)));
+                } catch (error) {
+                    console.error('Invalid server event', error);
+                }
+            });
+
+            room.on(LK.RoomEvent.Disconnected, () => {
+                room = null;
+                isRecording = false;
+                activeTurnBlock = null;
+                toggleBtn.textContent = 'Start Turn';
+                toggleBtn.classList.remove('recording');
+                providerSelect.disabled = false;
+                setStatus('Disconnected');
+            });
+
+            await room.connect(session.url, session.token);
+            providerSelect.disabled = true;
+        }
+
+        async function sendControl(type) {
+            if (!room) return;
+            const payload = encoder.encode(JSON.stringify({ type }));
+            await room.localParticipant.publishData(payload, {
+                reliable: true,
+                topic: 'carebuddy.control',
+            });
+        }
+
+        async function startTurn() {
+            toggleBtn.disabled = true;
+            setStatus('Connecting...');
+
+            try {
+                if (!room) {
+                    await connectRoom();
+                }
+
+                activeTurnBlock = createTurnBlock();
+                await sendControl('start');
+                await room.localParticipant.setMicrophoneEnabled(true, {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                });
+
+                isRecording = true;
+                toggleBtn.textContent = 'End Turn';
+                toggleBtn.classList.add('recording');
+                setStatus('Speaking');
+            } catch (error) {
+                console.error(error);
+                setStatus('Failed to start', true);
+                if (activeTurnBlock) {
+                    activeTurnBlock.remove();
+                    activeTurnBlock = null;
+                }
+                if (room) {
+                    await room.disconnect().catch(() => {});
+                }
+            } finally {
+                toggleBtn.disabled = false;
+            }
+        }
+
+        async function endTurn() {
+            if (!room) return;
+
+            toggleBtn.disabled = true;
             setStatus('Ending turn...');
 
             try {
-                ws.send(JSON.stringify({ type: "stop" }));
-                // Give backend time to process flush_turn + CareBuddy
-                await new Promise(r => setTimeout(r, 1200));
-            } catch (e) {
-                console.error("Error sending stop", e);
-            }
-
-            // Now safely cleanup audio
-            if (processor) { processor.disconnect(); processor = null; }
-            if (mediaStream) { 
-                mediaStream.getTracks().forEach(t => t.stop()); 
-                mediaStream = null; 
-            }
-            if (audioContext) { 
-                await audioContext.close().catch(() => {}); 
-                audioContext = null; 
-            }
-
-            toggleBtn.textContent = 'Start Turn';
-            toggleBtn.classList.remove('recording');
-        }
-
-        async function startStreaming() {
-            mediaStream = await navigator.mediaDevices.getUserMedia({
-                audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, sampleRate: 16000 }
-            });
-
-            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-            const source = audioContext.createMediaStreamSource(mediaStream);
-            processor = audioContext.createScriptProcessor(4096, 1, 1);
-
-            processor.onaudioprocess = (e) => {
-                if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                const inputData = e.inputBuffer.getChannelData(0);
-                const pcm16 = new Int16Array(inputData.length);
-                for (let i = 0; i < inputData.length; i++) {
-                    pcm16[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
-                }
-                ws.send(pcm16.buffer);
-            };
-
-            source.connect(processor);
-            processor.connect(audioContext.destination);
-        }
-
-        async function start() {
-            setStatus('Connecting...');
-            try {
-                ws = new WebSocket(`wss://${window.location.host}/ws/transcribe`);
-
-                ws.onopen = async () => {
-                    await startStreaming();
-                    setStatus('🎤 Speaking - Press End Turn when done');
-                    toggleBtn.textContent = 'End Turn';
-                    toggleBtn.classList.add('recording');
-                    activeTurnBlock = createTurnBlock();
-                };
-
-                ws.onmessage = (event) => {
-                    try {
-                        const data = JSON.parse(event.data);
-                        const type = data.type?.toLowerCase();
-                        const text = data.text?.trim();
-
-                        switch (type) {
-                            case "partial":
-                                if (text && activeTurnBlock) upsertPartial(activeTurnBlock, text);
-                                break;
-                            case "final":
-                                if (text && activeTurnBlock) appendSentence(activeTurnBlock, text);
-                                break;
-                            case "turn_complete":
-                                if (activeTurnBlock) {
-                                    sealTurnBlock(activeTurnBlock, text || '(no speech detected)');
-                                    activeTurnBlock = null;
-                                }
-                                setStatus('CareBuddy is thinking...');
-                                break;
-                            case "ai_response":
-                                createAIMessageBlock(text);
-                                setStatus('Ready - Click Start Turn to speak again');
-                                break;
-                            case "error":
-                                console.error("Backend error:", text);
-                                break;
-                        }
-                    } catch (e) {
-                        console.error("Parse error", e);
-                    }
-                };
-
-                ws.onclose = () => {
-                    console.log("WebSocket closed");
-                    toggleBtn.textContent = 'Start Turn';
-                    toggleBtn.classList.remove('recording');
-                };
-
-                ws.onerror = () => setStatus('Connection error', true);
-
-            } catch (err) {
-                setStatus('Failed to connect', true);
+                await room.localParticipant.setMicrophoneEnabled(false);
+                await new Promise(resolve => setTimeout(resolve, 300));
+                await sendControl('stop');
+                isRecording = false;
+                toggleBtn.textContent = 'Start Turn';
+                toggleBtn.classList.remove('recording');
+            } catch (error) {
+                console.error(error);
+                setStatus('Failed to end turn', true);
+            } finally {
+                toggleBtn.disabled = false;
             }
         }
 
-        // Button Handler
         toggleBtn.onclick = async () => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                await endCurrentTurn();
+            if (isRecording) {
+                await endTurn();
             } else {
-                await start();
+                await startTurn();
             }
         };
+
+        window.addEventListener('beforeunload', () => {
+            if (room) room.disconnect();
+        });
     </script>
 </body>
 </html>
